@@ -36,6 +36,7 @@ from agent.types import LLM
 from langchain_core.messages import convert_to_messages
 import uuid
 from langchain_core.load import load
+from langgraph.store.postgres import AsyncPostgresStore
 
 #Converters
 def convert_to_valid_messages(meassges: list[AnyMessage] | list[dict]) -> list[AnyMessage]:
@@ -84,6 +85,7 @@ class LLMConfiguration(BaseModel):
 
 class ContextSchema(BaseModel):
     llm_configuration: LLMConfiguration = LLMConfiguration()
+    user_id: str = "default_user"
     persona: str = Field(
         default = (
            AGENT_PERSONA
@@ -176,6 +178,23 @@ def get_sanitized_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
 
     return processed
 
+def get_last_turn_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """
+    Starts at the end and works backward to find the most recent HumanMessage,
+    then returns that message and all subsequent messages (the 'turn').
+    """
+    if not messages:
+        return []
+
+    # Find the index of the last HumanMessage
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            # Return from that HumanMessage to the very end
+            return messages[i:]
+            
+    # Fallback: if no human message is found, return everything (or empty)
+    return messages
+
 # Graph Nodes
 async def summarizer(state: State, runtime: Runtime[ContextSchema]) -> State:
     llm_config = runtime.context.llm_configuration
@@ -224,42 +243,35 @@ async def summarizer(state: State, runtime: Runtime[ContextSchema]) -> State:
         result = State(messages=messages)
     return result
 
-async def brain(state: State, runtime: Runtime[ContextSchema]) -> State:
+async def brain(state: State, runtime: Runtime[ContextSchema], *, store: BaseStore) -> State:
     llm_config = runtime.context.llm_configuration
     model_input = get_sanitized_messages(state["messages"])
-    
-    # LLM Persona should be light and loaded per context. LLM can overwrite persona. but persona should be light.
-    # Additional Funcitonality can be added
-    # Ensure the file exists on startup
-    
-    final_messages = model_input;
+    user_id = runtime.context.user_id 
+    namespace = ("memories", user_id)
+    current_persona = runtime.context.persona
+    # 2. Strategy: Only search the store if we are starting a new response
+    # but ALWAYS provide the persona context to the LLM.
+    memory_context = ""
     if not isinstance(model_input[-1], ToolMessage):
-        loop = asyncio.get_event_loop()
-        exists = await loop.run_in_executor(None, PROMPT_PATH.exists)
-        if not exists:
-            await loop.run_in_executor(
-                None, 
-                lambda: PROMPT_PATH.write_text("You are a helpful AI assistant.")
-            )
-        current_persona = None
-        async with aiofiles.open(PROMPT_PATH, mode='r') as f:
-            current_persona = await f.read() # You must await the .read() call specifically
-        llm_persona = SystemMessage(content=current_persona)
-        final_messages = [llm_persona] + final_messages
+        # Non-semantic metadata search
+        search_results = await store.asearch(
+            namespace, 
+            filter={"type": "user_preference"} 
+        )
+        relevant_memories = [res.value["content"] for res in search_results]
+        if relevant_memories:
+            memory_context = "\nRelevant Long-term Preferences:\n" + "\n".join(relevant_memories)
+
+    # 3. Construct Final System Message
+    # This ensures the LLM stays 'in character' even during tool loops
+    full_content = f"{current_persona}\n{memory_context}"
+    final_messages = [SystemMessage(content=full_content)] + model_input
+
+    # 4. Invoke
     llm_with_tools = await get_llm(llm_config)
     ai_message = await llm_with_tools.ainvoke(final_messages)
     
-    # After the response, we index the turn into LanceDB for Tier 3 memory
-    # text_to_index = f"User: {model_input[-1].content}\nAI: {ai_message.content}"
-    # tbl = get_or_create_table()
-    # vector = await embeddings_model.aembed_query(text_to_index)
-    # loop = asyncio.get_event_loop()
-    # await loop.run_in_executor(None, lambda: tbl.add([{"text": text_to_index, "vector": vector}]))
-    
-    result = State(
-        messages = [ai_message]
-    )
-    return result
+    return State(messages=[ai_message])
 
 async def image_processor(state: State, runtime: Runtime[ContextSchema]) -> State:
     """
@@ -293,6 +305,62 @@ async def image_processor(state: State, runtime: Runtime[ContextSchema]) -> Stat
     result = State(messages=refined_messages)   
     return result
 
+from langchain_core.messages import SystemMessage
+from langgraph.store.base import BaseStore
+from pydantic import BaseModel, Field
+
+
+# Define a schema for the memory we want to extract
+class MemoryExtraction(BaseModel):
+    facts: list[str] = Field(description="New facts about the user or project")
+    style_preferences: list[str] = Field(description="Preferences for how the AI should behave or code")
+
+async def memory_node(state: State,runtime: Runtime[ContextSchema], *, store: BaseStore):
+    """
+    Analyzes the conversation and saves long-term insights to the Postgres Store.
+    """
+    # 1. Get the user_id from config
+    user_id = runtime.context.user_id
+    namespace = ("memories", user_id)
+
+    # 2. Retrieve existing memories to avoid duplicates
+    existing_items = await store.asearch(namespace)
+    existing_memories = "\n".join([f"- {item.value}" for item in existing_items])
+
+    # 3. Use an LLM to extract new insights from the latest messages
+    # We use .with_structured_output to make parsing easy
+    llm = await get_llm(runtime.context.llm_configuration,[])
+    model = llm.with_structured_output(MemoryExtraction)
+    messages = get_last_turn_messages(state["messages"])
+    system_prompt = f"""
+    You are a memory-distillation assistant. 
+    """
+    human_message=f"""
+    Review the conversation below and identify any NEW facts or preferences about the user.
+    
+    EXISTING MEMORIES:
+    {existing_memories}
+    
+    CONVERSATION:
+    {messages} # Review the last exchange
+    """
+    
+    new_insights = await model.ainvoke([SystemMessage(content=system_prompt)] + [HumanMessage(content=human_message)])
+
+    # 4. Save the new insights to the Store
+    for fact in new_insights.facts:
+        # We use a UUID or a hash of the fact as the key to prevent duplicates
+        memory_id = str(hash(fact)) 
+        await store.aput(namespace, memory_id, {"content": fact, "type": "fact"})
+
+    for pref in new_insights.style_preferences:
+        # Use a unique ID so we don't overwrite the 'style_guide' every time
+        pref_id = f"pref_{hash(pref)}" 
+        await store.aput(namespace, pref_id, {"content": pref, "type": "user_preference"})
+
+    result = State(messages=[])
+    return result
+
 
 # Conditional Edges
 def decide_start(state: State, runtime: Runtime[ContextSchema]) -> Literal["summarizer", "brain_node"]:
@@ -322,7 +390,11 @@ def decide_image_processing(state: State, runtime: Runtime[ContextSchema]) -> Li
     else:
         result = "brain_node"
     return result
-
+def decide_after_brain(state: State):
+    route = tools_condition(state)
+    if route == END:
+        return "memory_node"
+    return "tools"
 # Graph Definition
 def get_graph():
     workflow = StateGraph(State, context_schema=ContextSchema)
@@ -331,6 +403,7 @@ def get_graph():
     workflow.add_node("brain_node", brain)
     workflow.add_node("summarizer", summarizer)
     workflow.add_node("image_processor", image_processor)
+    workflow.add_node("memory_node", memory_node)
     workflow.add_node("tools", ToolNode(ALL_TOOLS)) # 'tools' is your list of @tool functions
     
     # Edges
@@ -346,10 +419,10 @@ def get_graph():
     workflow.add_conditional_edges(
         "brain_node",
         # This helper function automatically checks if the LLM called a tool
-        tools_condition, 
+        decide_after_brain, 
         {
             "tools": "tools", # If tool called, go to 'tools' node
-            END: END          # If no tool called, finish
+            "memory_node": "memory_node"          # If no tool called, go to memory node
         }
     )
     workflow.add_conditional_edges(
@@ -361,30 +434,18 @@ def get_graph():
         } 
     )
     workflow.add_edge("image_processor", "brain_node")  # After image processing, go back to brain
+    workflow.add_edge("memory_node", END)
     return workflow
-# # Persistence Layer
-# def get_or_create_table():
-#     table_name = "chat_history"
-#     # Check if the table exists in the current database
-#     if table_name in db.table_names():
-#         return db.open_table(table_name)
-#     else:
-#         # Create the table with an initial dummy record to define the schema
-#         # The schema is inferred from this first entry
-#         return db.create_table(
-#             table_name, 
-#             data=[{"text": "initial_seed", "vector": [0.0] * 3072}] # 3072 is standard for Google text-embedding-2
-#         )
 
 
+    
 load_dotenv()
 PROMPT_PATH = Path("C:\\Users\\Ato_K\\Documents\\programming\\RoomLogic\\.agent_data\\system_prompt.md")
-
 graphName = "Agent"
 graph = ( get_graph()
             .compile(
                 name=graphName
-        )
+            )
 )
 
 # tools CRUD + Execute

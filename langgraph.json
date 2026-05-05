@@ -1,6 +1,9 @@
 {
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
+  "store": {
+    "type": "postgres"
+  },
   "graphs": {
     "EAA": "./src/agent/graph.py:graph"
   },

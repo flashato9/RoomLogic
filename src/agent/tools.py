@@ -79,4 +79,4 @@ def search_memory(query: str):
     # context = "\n---\n".join(results['text'].tolist())
     # return f"Found historical context:\n{context}"
 
-ALL_TOOLS = [run_python_task, search_memory]
+ALL_TOOLS = [run_python_task]
