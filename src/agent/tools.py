@@ -1,12 +1,10 @@
 import json
 from datetime import datetime
 import os
-import lancedb
 from langchain_experimental.utilities import PythonREPL
 from langchain_core.tools import tool
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 # Path to your ignored data folder
 DATA_DIR = r"C:\Users\Ato_K\Documents\programming\RoomLogic\.agent_data"

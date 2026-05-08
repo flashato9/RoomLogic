@@ -1,0 +1,15 @@
+services:
+  langgraph-api:
+    ports:
+      - "5679:5679"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY} # Crucial for the background embedding worker!
+  langgraph-postgres:
+    # Use the official pgvector image instead of standard postgres
+    image: pgvector/pgvector:pg16 
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "5432:5432"

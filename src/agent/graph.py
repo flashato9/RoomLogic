@@ -4,25 +4,15 @@ Returns a predefined response. Replace logic and configuration as needed.
 """
 
 from __future__ import annotations
-import asyncio
-from dataclasses import dataclass
-import inspect
-from math import remainder
-from os import system
-from re import S
 from typing import Annotated, Literal
-from urllib import response
 import uuid
 
-import aiofiles
+import debugpy
 from dotenv import load_dotenv
-import lancedb
 from langgraph.graph import END, START, StateGraph, add_messages
-from langgraph.prebuilt import InjectedState, ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
-from langgraph.types import Command, interrupt
 from langchain_core.messages import convert_to_messages
-from mypy import state
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings, data
@@ -30,13 +20,18 @@ from langgraph.runtime import Runtime
 from pathlib import Path
 from langgraph.graph.message import add_messages
 from agent.prompts import AGENT_PERSONA
-from langgraph.checkpoint.memory import MemorySaver
-from agent.tools import ALL_TOOLS, run_python_task, search_memory
+from agent.tools import ALL_TOOLS
 from agent.types import LLM
 from langchain_core.messages import convert_to_messages
 import uuid
 from langchain_core.load import load
-from langgraph.store.postgres import AsyncPostgresStore
+
+import os
+from langchain_core.messages import SystemMessage
+from langgraph.store.base import BaseStore
+from pydantic import BaseModel, Field
+
+
 
 #Converters
 def convert_to_valid_messages(meassges: list[AnyMessage] | list[dict]) -> list[AnyMessage]:
@@ -253,10 +248,18 @@ async def brain(state: State, runtime: Runtime[ContextSchema], *, store: BaseSto
     # but ALWAYS provide the persona context to the LLM.
     memory_context = ""
     if not isinstance(model_input[-1], ToolMessage):
-        # Non-semantic metadata search
+        # Extract the user's latest message to use as our search query
+        query_text = ""
+        for msg in reversed(model_input):
+            if isinstance(msg, HumanMessage):
+                query_text = str(msg.content)
+                break
+        # 2. SEMANTIC SEARCH: Pass the query_text to the store
+        # This tells Postgres to rank memories by relevance to the query!
         search_results = await store.asearch(
             namespace, 
-            filter={"type": "user_preference"} 
+            query=query_text, # <-- The magic parameter
+            limit=5           # Only grab the top 5 most relevant facts
         )
         relevant_memories = [res.value["content"] for res in search_results]
         if relevant_memories:
@@ -305,17 +308,12 @@ async def image_processor(state: State, runtime: Runtime[ContextSchema]) -> Stat
     result = State(messages=refined_messages)   
     return result
 
-from langchain_core.messages import SystemMessage
-from langgraph.store.base import BaseStore
-from pydantic import BaseModel, Field
-
-
 # Define a schema for the memory we want to extract
 class MemoryExtraction(BaseModel):
     facts: list[str] = Field(description="New facts about the user or project")
     style_preferences: list[str] = Field(description="Preferences for how the AI should behave or code")
 
-async def memory_node(state: State,runtime: Runtime[ContextSchema], *, store: BaseStore):
+async def memory_saver(state: State,runtime: Runtime[ContextSchema], *, store: BaseStore):
     """
     Analyzes the conversation and saves long-term insights to the Postgres Store.
     """
@@ -393,17 +391,23 @@ def decide_image_processing(state: State, runtime: Runtime[ContextSchema]) -> Li
 def decide_after_brain(state: State):
     route = tools_condition(state)
     if route == END:
-        return "memory_node"
+        return "memory_saver"
     return "tools"
 # Graph Definition
 def get_graph():
+    try:
+        # 0.0.0.0 is required inside Docker!
+        debugpy.listen(("0.0.0.0", 5679))
+    except Exception:
+        pass # Prevents the worker crash we saw earlier
+
     workflow = StateGraph(State, context_schema=ContextSchema)
     
     # Nodes
     workflow.add_node("brain_node", brain)
     workflow.add_node("summarizer", summarizer)
     workflow.add_node("image_processor", image_processor)
-    workflow.add_node("memory_node", memory_node)
+    workflow.add_node("memory_saver", memory_saver)
     workflow.add_node("tools", ToolNode(ALL_TOOLS)) # 'tools' is your list of @tool functions
     
     # Edges
@@ -422,7 +426,7 @@ def get_graph():
         decide_after_brain, 
         {
             "tools": "tools", # If tool called, go to 'tools' node
-            "memory_node": "memory_node"          # If no tool called, go to memory node
+            "memory_saver": "memory_saver"          # If no tool called, go to memory node
         }
     )
     workflow.add_conditional_edges(
@@ -434,20 +438,35 @@ def get_graph():
         } 
     )
     workflow.add_edge("image_processor", "brain_node")  # After image processing, go back to brain
-    workflow.add_edge("memory_node", END)
+    workflow.add_edge("memory_saver", END)
     return workflow
 
+# Embedding Function
+# 2. Add this wrapper function specifically for LangGraph API
+async def aembed_texts(texts: list[str]) -> list[list[float]]:
+    """LangGraph worker will call this async function to embed text."""
+    return await embedding_object.aembed_documents(texts)
 
-    
-load_dotenv()
-PROMPT_PATH = Path("C:\\Users\\Ato_K\\Documents\\programming\\RoomLogic\\.agent_data\\system_prompt.md")
-graphName = "Agent"
-graph = ( get_graph()
+# Compiled Graph Definition
+def get_compiled_graph(db_uri: str):
+    graphName = "Agent"
+    result = (
+        get_graph()
             .compile(
-                name=graphName
+                name=graphName,
             )
-)
+    )
+    return result;
 
+#LOAD Variables - DB, prompt, embedding object, graph
+load_dotenv()
+DB_URI = os.getenv("POSTGRES_URI", "postgresql://postgres:postgres@langgraph-postgres:5432/postgres")
+PROMPT_PATH = Path("C:\\Users\\Ato_K\\Documents\\programming\\RoomLogic\\.agent_data\\system_prompt.md")
+embedding_object = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-2",
+    output_dimensionality=768 
+)
+graph = get_compiled_graph(DB_URI)
 # tools CRUD + Execute
 #   create files on the file system.
 #   read files on the file system.

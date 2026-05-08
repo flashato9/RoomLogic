@@ -2,7 +2,11 @@
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
   "store": {
-    "type": "postgres"
+    "index": {
+      "embed": "./src/agent/graph.py:aembed_texts", 
+      "dims": 768,
+      "fields": ["content"]
+    }
   },
   "graphs": {
     "EAA": "./src/agent/graph.py:graph"
