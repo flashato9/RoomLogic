@@ -13,17 +13,17 @@
       "name": "Attach to LangGraph",
       "type": "debugpy",
       "request": "attach",
-      "justMyCode": false,
+      // "justMyCode": false,
       "connect": {
         "host": "127.0.0.1",
         "port": 5679
       },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/deps/SemanticOS"
-        }
-      ]
+      // "pathMappings": [
+      //   {
+      //     "localRoot": "${workspaceFolder}",
+      //     "remoteRoot": "/deps/SemanticOS"
+      //   }
+      // ]
     }
   ]
 }

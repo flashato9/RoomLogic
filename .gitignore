@@ -163,3 +163,4 @@ cython_debug/
 .langgraph_api/
 report.html
 .agent_data/vectors/
+static/agent_files/hello/helloworld.py

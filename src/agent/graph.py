@@ -30,6 +30,7 @@ import os
 from langchain_core.messages import SystemMessage
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
+from agent.models import ContextSchema, LLMConfiguration
 
 
 
@@ -71,26 +72,6 @@ def robust_message_reducer(left: list[AnyMessage], right: list[AnyMessage] | lis
 # Classes - State, LLMConfiguration, ContextSchema
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], robust_message_reducer]
-
-       
-class LLMConfiguration(BaseModel):
-    "the configuration for the llm"
-    model_name: str = "gemini-flash-lite-latest"
-    temperature: float = 1.0
-
-class ContextSchema(BaseModel):
-    llm_configuration: LLMConfiguration = LLMConfiguration()
-    user_id: str = "default_user"
-    persona: str = Field(
-        default = (
-           AGENT_PERSONA
-           ),
-        description = "The persona for the assistant",
-        json_schema_extra={
-            "langgraph_nodes": ["brain_node"],
-            "langgraph_type": "prompt"
-        }
-    )
 
 # Get LLM
 async def get_llm(llm_config: LLMConfiguration, tools: list = ALL_TOOLS) -> LLM:
@@ -362,7 +343,7 @@ async def memory_saver(state: State,runtime: Runtime[ContextSchema], *, store: B
 
 # Conditional Edges
 def decide_start(state: State, runtime: Runtime[ContextSchema]) -> Literal["summarizer", "brain_node"]:
-    message_threshold = 15
+    message_threshold = runtime.context.message_threshold
 
     messages = state["messages"]
 
