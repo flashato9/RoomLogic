@@ -12,6 +12,7 @@ from typing import Annotated, Any, Optional
 from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 from langgraph.runtime import Runtime
+from langchain_tavily import TavilySearch
 
 
 from agent.models import ContextSchema, LLMConfiguration, ToolsConfig, ToolResult
@@ -584,6 +585,58 @@ def get_pwd_context(
         )
 
     return result.to_state_update()
+
+# Assuming these are imported from your agent.models
+# from agent.models import ToolRuntime, ContextSchema, ToolResult
+
+@tool
+def search_internet(
+    query: str,
+    runtime_config: ToolRuntime[ContextSchema]
+) -> dict:
+    """
+    Searches the internet to find real-time information, news, or technical documentation.
+    Use this when the user asks about current events or topics outside your local workspace.
+
+    Args:
+        query: The specific search string or question to look up.
+    """
+    # Tavily is pre-optimized for AI agents
+    search = TavilySearch(
+        max_results=5,
+        search_depth="advanced", # "advanced" is better for technical/detailed queries
+        include_answer=True,      # Returns a short AI-generated summary of the results
+        include_raw_content=False # Keep it clean to save tokens
+    )
+
+    try:
+        # 1. Execute the search
+        raw_results = search.invoke({"query": query})
+        
+        # 2. Format findings for the agent's mental model
+        # Tavily returns a list of dicts with 'url' and 'content'
+        formatted_output = {
+            "query": query,
+            "results": raw_results
+        }
+
+        # 3. Create semantic meaning
+        # If Tavily generated an answer, we use that as the primary 'meaning'
+        result = ToolResult(
+            success=True,
+            output=formatted_output,
+            meaning=f"Internet search for '{query}' completed. Found {len(raw_results)} relevant sources."
+        )
+
+    except Exception as e:
+        result = ToolResult(
+            success=False,
+            output=None,
+            error=str(e),
+            meaning=f"Internet search failed for '{query}': {str(e)}"
+        )
+
+    return result.to_state_update()
 ALL_TOOLS = [ 
                 get_directory_contents,
                 get_pwd_context,
@@ -592,5 +645,6 @@ ALL_TOOLS = [
                 update_file,
                 patch_file,
                 delete_file,  
-                execute_file
+                execute_file,
+                search_internet
             ]

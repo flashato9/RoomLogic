@@ -30,7 +30,7 @@ import os
 from langchain_core.messages import SystemMessage
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
-from agent.models import ContextSchema, LLMConfiguration
+from agent.models import ContextSchema, LLMConfiguration, MemoryExtraction
 
 
 
@@ -80,7 +80,7 @@ async def get_llm(llm_config: LLMConfiguration, tools: list = ALL_TOOLS) -> LLM:
         temperature=llm_config.temperature,
         max_tokens=None,
         timeout=None,
-        max_retries=2,
+        max_retries=5,
         )
     llm = model.bind_tools(tools)
     return llm
@@ -221,17 +221,17 @@ async def summarizer(state: State, runtime: Runtime[ContextSchema]) -> State:
 
 async def brain(state: State, runtime: Runtime[ContextSchema], *, store: BaseStore) -> State:
     llm_config = runtime.context.llm_configuration
-    model_input = get_sanitized_messages(state["messages"])
+    user_messages = get_sanitized_messages(state["messages"])
     user_id = runtime.context.user_id 
     namespace = ("memories", user_id)
     current_persona = runtime.context.persona
     # 2. Strategy: Only search the store if we are starting a new response
     # but ALWAYS provide the persona context to the LLM.
     memory_context = ""
-    if not isinstance(model_input[-1], ToolMessage):
+    if not isinstance(user_messages[-1], ToolMessage):
         # Extract the user's latest message to use as our search query
         query_text = ""
-        for msg in reversed(model_input):
+        for msg in reversed(user_messages):
             if isinstance(msg, HumanMessage):
                 query_text = str(msg.content)
                 break
@@ -249,7 +249,7 @@ async def brain(state: State, runtime: Runtime[ContextSchema], *, store: BaseSto
     # 3. Construct Final System Message
     # This ensures the LLM stays 'in character' even during tool loops
     full_content = f"{current_persona}\n{memory_context}"
-    final_messages = [SystemMessage(content=full_content)] + model_input
+    final_messages = [SystemMessage(content=full_content)] + user_messages
 
     # 4. Invoke
     llm_with_tools = await get_llm(llm_config)
@@ -288,11 +288,6 @@ async def image_processor(state: State, runtime: Runtime[ContextSchema]) -> Stat
 
     result = State(messages=refined_messages)   
     return result
-
-# Define a schema for the memory we want to extract
-class MemoryExtraction(BaseModel):
-    facts: list[str] = Field(description="New facts about the user or project")
-    style_preferences: list[str] = Field(description="Preferences for how the AI should behave or code")
 
 async def memory_saver(state: State,runtime: Runtime[ContextSchema], *, store: BaseStore):
     """
@@ -429,7 +424,7 @@ async def aembed_texts(texts: list[str]) -> list[list[float]]:
     return await embedding_object.aembed_documents(texts)
 
 # Compiled Graph Definition
-def get_compiled_graph(db_uri: str):
+def get_compiled_graph() -> StateGraph:
     graphName = "Agent"
     result = (
         get_graph()
@@ -439,15 +434,13 @@ def get_compiled_graph(db_uri: str):
     )
     return result;
 
-#LOAD Variables - DB, prompt, embedding object, graph
+#LOAD Variables - embedding object, graph
 load_dotenv()
-DB_URI = os.getenv("POSTGRES_URI", "postgresql://postgres:postgres@langgraph-postgres:5432/postgres")
-PROMPT_PATH = Path("C:\\Users\\Ato_K\\Documents\\programming\\SemanticOS\\.agent_data\\system_prompt.md")
 embedding_object = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-2",
     output_dimensionality=768 
 )
-graph = get_compiled_graph(DB_URI)
+graph = get_compiled_graph()
 # tools CRUD + Execute
 #   create files on the file system.
 #   read files on the file system.

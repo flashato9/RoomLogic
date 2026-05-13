@@ -13,6 +13,7 @@ dependencies = [
     "debugpy>=1.8.20",
     "langchain-experimental>=0.4.1",
     "langchain-google-genai>=4.2.2",
+    "langchain-tavily>=0.2.18",
     "langgraph>=1.0.0",
     "mypy>=1.19.1",
     "psycopg>=3.3.4",

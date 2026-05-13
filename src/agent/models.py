@@ -62,3 +62,8 @@ class ToolResult(BaseModel):
             "artifact_log": [self.model_dump()],
             "messages": [self.meaning]
         }
+        
+# Define a schema for the memory we want to extract
+class MemoryExtraction(BaseModel):
+    facts: list[str] = Field(description="New facts about the user or project")
+    style_preferences: list[str] = Field(description="Preferences for how the AI should behave or code")
