@@ -1,7 +1,13 @@
 import copy
+from typing import List
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.store.base import BaseStore
+
+from agent.models import ConsolidationResult, LLMConfiguration, MemoryExtraction, MemoryInsight, MemoryValue
+from agent.tools import ALL_TOOLS
+from agent.types import LLM
 
 def get_message_flatten_text_content(message: AIMessage) -> AIMessage:
     """
@@ -49,38 +55,50 @@ def get_message_flatten_text_content(message: AIMessage) -> AIMessage:
 
     return message
 
-async def get_latest_relevant_memories(
+async def get_relevant_memories(
     query: str, 
     namespace: tuple, 
     store: BaseStore, 
-    candidate_limit: int = 15, 
-    final_limit: int = 5
+    threshold: float = 0.70,
+    limit: int = 5
 ) -> str:
     """
-    Finds relevant memories and ensures only the most recent version 
-    of any given category is returned.
+    Retrieves the most semantically relevant memories, sorts them 
+    chronologically, and formats them with timestamps.
     """
-    search_results = await store.asearch(namespace, query=query, limit=candidate_limit)
+    # 1. Perform semantic search (Ordered by Score)
+    search_results = await store.asearch(namespace, query=query, limit=limit)
+    
     if not search_results:
         return ""
-    default_created_at = "1970-01-01T00:00:00Z"
-    # Sort candidates by created_at descending (newest first)
-    sorted_results = sorted(
-        search_results, 
-        key=lambda x: x.value.get("created_at", default_created_at), 
-        reverse=True
-    )
 
-    resolved_memories = {}
-    for res in sorted_results:
-        category = res.value.get("category", "uncategorized")
-        # First one found for a category is the latest; lock it in
-        if category not in resolved_memories:
-            resolved_memories[category] = res.value["content"]
+    # 2. Filter by threshold and parse into MemoryValue objects
+    relevant_memories = [
+        MemoryValue(**res.value) 
+        for res in search_results 
+        if res.score >= threshold
+    ]
 
-    # Limit to the top unique results and format
-    final_facts = list(resolved_memories.values())[:final_limit]
-    return "\nRelevant Long-term Preferences:\n" + "\n".join([f"- {f}" for f in final_facts])
+    if not relevant_memories:
+        return ""
+
+    # 3. Sort by created_at (Oldest -> Newest)
+    # This ensures the most recent information is the last thing the LLM reads.
+    relevant_memories.sort(key=lambda m: m.created_at)
+
+    # 4. Format for the LLM
+    header = "\nRelevant Long-term Context (Chronological Order):\n"
+    
+    formatted_items = []
+    for m in relevant_memories:
+        # Option A: Clean ISO format (e.g., 2026-05-13 23:38)
+        # We replace the 'T' with a space and take the first 16 characters
+        timestamp_label = m.created_at.replace("T", " ")[:16]
+        
+        # 2. Append with the category and content
+        formatted_items.append(f"- [{timestamp_label}] ({m.category}) {m.content}")
+    
+    return header + "\n".join(formatted_items)
 
 async def is_semantically_redundant(insight_content: str, namespace: tuple, store: BaseStore, threshold: float = 0.9) -> bool:
     """
@@ -99,3 +117,108 @@ async def is_semantically_redundant(insight_content: str, namespace: tuple, stor
             return True
             
     return False
+
+# Get LLM
+async def get_llm(llm_config: LLMConfiguration, tools: list = ALL_TOOLS) -> LLM:
+    model = ChatGoogleGenerativeAI(
+        model=llm_config.model_name,
+        temperature=llm_config.temperature,
+        max_tokens=None,
+        timeout=None,
+        max_retries=5,
+        )
+    llm = model.bind_tools(tools)
+    return llm
+
+async def get_similar_in_category(
+    insight: MemoryInsight, 
+    namespace: tuple, 
+    store: BaseStore, 
+    threshold: float = 0.9, 
+    limit: int = 10
+):
+    """
+    Returns only memories that share the same category AND exceed the similarity threshold.
+    """
+    results = await store.asearch(namespace, query=insight.content, limit=20)
+    
+    # Combined filter: Category Match + Similarity Threshold
+    return [
+        res for res in results 
+        if res.value.get("category") == insight.category.lower() 
+        and res.score >= threshold
+    ][:limit]
+
+async def consolidate_and_verify(insight: MemoryInsight, lineage: list, config: dict) -> ConsolidationResult:
+    """
+    LLM determines the current stance and provides a confidence score to prevent summary drift.
+    """
+    llm = await get_llm(config, [])
+    model = llm.with_structured_output(ConsolidationResult)
+    
+    lineage_text = "\n".join([f"- [{item.value.get('created_at')}] {item.value.get('content')}" for item in lineage])
+    
+    system_prompt = """
+    You are a Memory Verification Expert. Analyze a new insight against historical records.
+    Determine the definitive current stance. 
+    Provide a 'confidence' score (0.0-1.0). If the history is contradictory or 
+    the new insight is a total shift, lower the confidence.
+    """
+    
+    prompt = f"NEW INSIGHT: {insight.content}\n\nHISTORY:\n{lineage_text}"
+    return await model.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+
+async def get_existing_categories(namespace: tuple, store: BaseStore) -> List[str]:
+    """
+    Retrieves the unique list of categories currently stored for this user.
+    """
+    # Pull a larger sample to ensure we capture the taxonomy
+    # Note: If your store supports a specific 'distinct' query, use that instead.
+    results = await store.asearch(namespace, query="", limit=50) 
+    memories = [MemoryValue(**res.value) for res in results]
+    categories = {
+        res.category
+        for res in memories 
+        if res.category
+    }
+    return list(categories)
+
+async def extract_new_insights(
+    messages: list, 
+    config: LLMConfiguration, 
+    existing_categories: List[str]
+) -> List[MemoryInsight]:
+    """
+    Distills insights while constraining categories to the existing taxonomy.
+    """
+    llm = await get_llm(config, [])
+    model = llm.with_structured_output(MemoryExtraction)
+    
+    # Format categories for the prompt
+    category_list = ", ".join(existing_categories) if existing_categories else "None yet"
+
+    system_prompt = f"""
+    You are a memory-distillation assistant for a Semantic OS. 
+    Your goal is to extract NEW, meaningful insights from the provided conversation history.
+
+    EXISTING TAXONOMY: {category_list}
+
+    CONVERSATION STRUCTURE:
+    - The messages below are provided in CHRONOLOGICAL ORDER (Earliest first, Latest last).
+    - Each message includes a [YYYY-MM-DD HH:MM] timestamp.
+    - Pay special attention to the LATEST messages, as they represent the user's most current state or updated preferences.
+
+    GUIDELINES:
+    1. REUSE CATEGORIES: If an insight fits into an existing category above, you MUST use it exactly.
+    2. NEW CATEGORIES: Only create a new snake_case category if the insight absolutely does not fit.
+    3. NO 'UNCATEGORIZED': Never use 'uncategorized'. Create a specific new label if needed.
+    4. TYPE: 'fact' or 'user_preference'.
+    5. CONTENT: Write a clear, standalone sentence. If a user's preference changed during this session, only extract the final, most recent preference.
+    """
+    
+    extraction_result = await model.ainvoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"CONVERSATION TO REVIEW:\n{messages}")
+    ])
+    
+    return extraction_result.insights

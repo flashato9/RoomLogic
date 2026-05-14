@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -75,3 +76,29 @@ class MemoryInsight(BaseModel):
 
 class MemoryExtraction(BaseModel):
     insights: List[MemoryInsight]   
+    
+class ConsolidationResult(BaseModel):
+    content: str = Field(description="The new authoritative summary of the user's stance.")
+    confidence: float = Field(description="Score from 0.0 to 1.0 on how accurately this represents the timeline.")
+    reasoning: str = Field(description="Brief explanation of why this stance was chosen.")
+    
+class MemoryValue(BaseModel):
+    content: str = Field(..., description="The distilled fact or preference statement.")
+    type: str = Field(..., description="Classification: 'fact' or 'user_preference'.")
+    category: str = Field(default="uncategorized", description="The snake_case grouping key for conflict resolution.")
+    created_at: str = Field(
+        default_factory=lambda: datetime.fromtimestamp(0, tz=timezone.utc).isoformat(),
+        description="ISO 8601 timestamp of when the memory was captured or consolidated."
+    )
+    thread_id: str = Field(default="legacy_thread", description="The unique ID of the conversation thread.")
+    parent_references: List[str] = Field(
+        default_factory=list, 
+        description="List of IDs in the stale_memories namespace that this entry summarizes."
+    )
+    consolidation_reason: str = Field(
+        default="", 
+        description="LLM's explanation for why this specific summary was created."
+    )
+
+    def to_dict(self):
+        return self.model_dump()

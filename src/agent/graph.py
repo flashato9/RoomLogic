@@ -5,7 +5,7 @@ Returns a predefined response. Replace logic and configuration as needed.
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated, List, Literal
 import uuid
 
 import debugpy
@@ -20,7 +20,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langgraph.runtime import Runtime
 from pathlib import Path
 from langgraph.graph.message import add_messages
-from agent.helper_func import get_latest_relevant_memories, get_message_flatten_text_content, is_semantically_redundant
+from agent.helper_func import consolidate_and_verify, extract_new_insights, get_existing_categories, get_llm, get_message_flatten_text_content, get_relevant_memories, get_similar_in_category, is_semantically_redundant
 from agent.prompts import AGENT_PERSONA
 from agent.tools import ALL_TOOLS
 from agent.types import LLM
@@ -32,7 +32,7 @@ import os
 from langchain_core.messages import SystemMessage
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
-from agent.models import ContextSchema, LLMConfiguration, MemoryExtraction
+from agent.models import ContextSchema, LLMConfiguration, MemoryExtraction, MemoryValue
 
 
 
@@ -74,18 +74,6 @@ def robust_message_reducer(left: list[AnyMessage], right: list[AnyMessage] | lis
 # Classes - State, LLMConfiguration, ContextSchema
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], robust_message_reducer]
-
-# Get LLM
-async def get_llm(llm_config: LLMConfiguration, tools: list = ALL_TOOLS) -> LLM:
-    model = ChatGoogleGenerativeAI(
-        model=llm_config.model_name,
-        temperature=llm_config.temperature,
-        max_tokens=None,
-        timeout=None,
-        max_retries=5,
-        )
-    llm = model.bind_tools(tools)
-    return llm
 
 #Node Helper Functions
 def get_sanitized_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -233,8 +221,8 @@ async def brain(state: State, runtime: Runtime[ContextSchema], *, store: BaseSto
     if not isinstance(user_messages[-1], ToolMessage):
         query_text = next((str(m.content) for m in reversed(user_messages) if isinstance(m, HumanMessage)), "")
         if query_text:
-            memory_context = await get_latest_relevant_memories(query_text, namespace, store)
-
+            memory_context = await get_relevant_memories(query_text, namespace, store)
+            
     # 3. Message Construction
     system_content = f"{runtime.context.persona}\n{memory_context}"
     final_messages = [SystemMessage(content=system_content)] + user_messages
@@ -281,49 +269,59 @@ async def image_processor(state: State, runtime: Runtime[ContextSchema]) -> Stat
     return result
 
 async def memory_saver(state: State, runtime: Runtime[ContextSchema], *, store: BaseStore):
-    """
-    Orchestrates the extraction and deduplicated saving of user memories.
-    """
     user_id = runtime.context.user_id
-    namespace = ("memories", user_id)
+    active_ns = ("memories", user_id)
+    stale_ns = ("stale_memories", user_id)
     thread_id = runtime.execution_info.thread_id
+    llm_config = runtime.context.llm_configuration
 
-    # 1. Extract potential insights from the last exchange
     last_messages = get_last_turn_messages(state["messages"])
     
-    llm = await get_llm(runtime.context.llm_configuration, [])
-    model = llm.with_structured_output(MemoryExtraction)
+    # 1. Fetch current taxonomy to prevent bloat
+    existing_categories = await get_existing_categories(active_ns, store)
     
-    system_prompt = """
-    You are a memory-distillation assistant. Extract NEW facts or preferences about the user.
-    - CATEGORY: Use snake_case (e.g., 'food_preference').
-    - TYPE: 'fact' or 'user_preference'.
-    - CONTENT: A clear, standalone statement.
-    """
-    
-    extracted = await model.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"CONVERSATION TO REVIEW:\n{last_messages}")
-    ])
-    
-    new_insights = extracted.insights
+    new_insights = await extract_new_insights(last_messages, llm_config, existing_categories)
 
-    # 2. Process and save unique insights
     for insight in new_insights:
-        # Targeted check: Does this exact idea already exist in our Vector Store?
-        if await is_semantically_redundant(insight.content, namespace, store):
-            continue # Skip saving to prevent the image_cd47a0.png duplication issue
+        # 1. Targeted Search with Strict Category Filtering
+        similar_items = await get_similar_in_category(insight, active_ns, store, threshold=0.70)
+        consolidation_threshold = 5
+        is_redundant = len(similar_items) > consolidation_threshold
 
-        # 3. Save the fresh insight with full metadata
-        memory_id = str(uuid.uuid4())
-        value = {
-            "content": insight.content,
-            "type": insight.type,
-            "category": insight.category.lower(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "thread_id": thread_id
-        }
-        await store.aput(namespace, memory_id, value)
+        if is_redundant:
+            # 2. Consolidation with Verification
+            result = await consolidate_and_verify(insight, similar_items, llm_config)
+            
+            if result.confidence >= 0.8:
+                # 3. ARCHIVE: Move stale data & update references
+                stale_ids = []
+                for item in similar_items:
+                    # Move to stale namespace
+                    await store.aput(stale_ns, item.key, item.value)
+                    # Delete from active
+                    await store.adelete(active_ns, item.key)
+                    stale_ids.append(item.key)
+                    
+                mem_obj = MemoryValue(
+                    content=result.content,
+                    type=insight.type,
+                    category=insight.category.lower(),
+                    thread_id=thread_id,
+                    parent_references=stale_ids,
+                    consolidation_reason=result.reasoning
+                )
+                # 4. INSERT SUMMARY: Point to archived lineage
+                await store.aput(active_ns, str(uuid.uuid4()), mem_obj.to_dict())
+                continue # Process next insight
+        
+        mem_obj = MemoryValue(
+            content=insight.content,
+            type=insight.type,
+            category=insight.category.lower(),
+            thread_id=thread_id
+        )
+        # 5. DEFAULT: Insert as new if not redundant OR if confidence was low
+        await store.aput(active_ns, str(uuid.uuid4()), mem_obj.to_dict())
 
     return State(messages=[])
 
