@@ -47,6 +47,11 @@ class ContextSchema(BaseModel):
         description="The number of recent messages to include in the context for decision making. Older messages will be summarized into the 'meaning' field of ToolResult."
     )
     tool_config: ToolsConfig = ToolsConfig()
+    consine_similarity_threshold: float = Field(
+        default=0.70,
+        description="The default value to use for filtering good results for cosine_similariy"
+    )
+
     
 class ToolResult(BaseModel):
     """The universal response object for all agentic tools."""

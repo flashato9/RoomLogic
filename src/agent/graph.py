@@ -20,7 +20,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langgraph.runtime import Runtime
 from pathlib import Path
 from langgraph.graph.message import add_messages
-from agent.helper_func import consolidate_and_verify, extract_new_insights, get_existing_categories, get_llm, get_message_flatten_text_content, get_relevant_memories, get_similar_in_category, is_semantically_redundant
+from agent.node_helper_func import consolidate_and_verify, extract_new_insights, get_existing_categories, get_message_flatten_text_content, get_similar_in_category, is_semantically_redundant
+from agent.node_and_tool_helper_func import get_relevant_memories
+from agent.node_helper_func import get_llm
 from agent.prompts import AGENT_PERSONA
 from agent.tools import ALL_TOOLS
 from agent.types import LLM
@@ -274,6 +276,7 @@ async def memory_saver(state: State, runtime: Runtime[ContextSchema], *, store: 
     stale_ns = ("stale_memories", user_id)
     thread_id = runtime.execution_info.thread_id
     llm_config = runtime.context.llm_configuration
+    consine_similarity_threshold = runtime.context.consine_similarity_threshold
 
     last_messages = get_last_turn_messages(state["messages"])
     
@@ -284,7 +287,7 @@ async def memory_saver(state: State, runtime: Runtime[ContextSchema], *, store: 
 
     for insight in new_insights:
         # 1. Targeted Search with Strict Category Filtering
-        similar_items = await get_similar_in_category(insight, active_ns, store, threshold=0.70)
+        similar_items = await get_similar_in_category(insight, active_ns, store, threshold=consine_similarity_threshold)
         consolidation_threshold = 5
         is_redundant = len(similar_items) > consolidation_threshold
 
@@ -308,7 +311,8 @@ async def memory_saver(state: State, runtime: Runtime[ContextSchema], *, store: 
                     category=insight.category.lower(),
                     thread_id=thread_id,
                     parent_references=stale_ids,
-                    consolidation_reason=result.reasoning
+                    consolidation_reason=result.reasoning,
+                    created_at=datetime.now(timezone.utc).isoformat()
                 )
                 # 4. INSERT SUMMARY: Point to archived lineage
                 await store.aput(active_ns, str(uuid.uuid4()), mem_obj.to_dict())
@@ -318,7 +322,8 @@ async def memory_saver(state: State, runtime: Runtime[ContextSchema], *, store: 
             content=insight.content,
             type=insight.type,
             category=insight.category.lower(),
-            thread_id=thread_id
+            thread_id=thread_id,
+            created_at=datetime.now(timezone.utc).isoformat()
         )
         # 5. DEFAULT: Insert as new if not redundant OR if confidence was low
         await store.aput(active_ns, str(uuid.uuid4()), mem_obj.to_dict())

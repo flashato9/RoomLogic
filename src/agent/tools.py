@@ -13,8 +13,10 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 from langgraph.runtime import Runtime
 from langchain_tavily import TavilySearch
+from langgraph.store.base import BaseStore
 
 
+from agent.node_and_tool_helper_func import get_relevant_memories
 from agent.models import ContextSchema, LLMConfiguration, ToolsConfig, ToolResult
 
 # Path to your ignored data folder
@@ -72,21 +74,67 @@ def run_python_task(code: str, reasoning: str) -> str:
 # table_name = "chat_history"
 # embeddings_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
 @tool
-def search_memory(query: str):
-    """Searches the long-term semantic database for past conversation context."""
-    return "";
-    # query_vector = embeddings_model.embed_query(query)
+async def search_memory(
+    query: str, 
+    runtime_config: ToolRuntime[ContextSchema]
+) -> str:
+    """
+    Search your long-term memory for specific facts, preferences, or 
+    past interactions that aren't in the current conversation.
     
-    # tbl = db.open_table(table_name)
+    Args:
+        query: The search term or semantic description of the memory to find.
+    Returns:
+        A structured response containing:   
+        - success: Whether the memory read operation was successful.
+        - output: If successful, includes the memory content.
+        - error: If failed, a detailed error message.
+        - meaning: A human-readable summary for the agent's context, guiding its next steps.
     
-    # # 2. Pass the vector, not the string, to .search()
-    # results = tbl.search(query_vector).limit(3).to_pandas()
+    """
+    store = runtime_config.store
+    user_id = runtime_config.context.user_id
+    consine_similarity_threshold = runtime_config.context.consine_similarity_threshold
     
-    # if results.empty:
-    #     return "No relevant past memories found."
-    
-    # context = "\n---\n".join(results['text'].tolist())
-    # return f"Found historical context:\n{context}"
+    namespace = ("memories", user_id)
+
+    try:
+        # 1. Reuse the core helper function
+        # We increase the limit slightly for tool calls (10 vs 5) to give the agent more to work with
+        memory_text = await get_relevant_memories(
+            query=query,
+            namespace=namespace,
+            store=store,
+            threshold=consine_similarity_threshold,
+            limit=10
+        )
+
+        # 2. Handle Empty Results
+        if not memory_text:
+            result = ToolResult(
+                success=True,
+                output=None,
+                meaning=f"No relevant memories found for the query: '{query}'."
+            )
+        else:
+            # 3. Success Feedback
+            result = ToolResult(
+                success=True,
+                output={"content": memory_text},
+                meaning=f"Relevant historical context retrieved for: '{query}'."
+            )
+
+    except Exception as e:
+        # 4. Error Handling
+        result = ToolResult(
+            success=False,
+            output=None,
+            error=str(e),
+            meaning=f"An error occurred while searching memory: {str(e)}"
+        )
+
+    return result.to_state_update()
+
 @tool
 def create_file(file_path: str, content: str, runtime_config: ToolRuntime[ContextSchema]) -> str:
     """
@@ -601,7 +649,7 @@ def search_internet(
     Args:
         query: The specific search string or question to look up.
     """
-    # Tavily is pre-optimized for AI agents
+    # Tavily is pre-optimized  for AI agents
     search = TavilySearch(
         max_results=5,
         search_depth="advanced", # "advanced" is better for technical/detailed queries
@@ -646,5 +694,6 @@ ALL_TOOLS = [
                 patch_file,
                 delete_file,  
                 execute_file,
-                search_internet
+                search_internet,
+                search_memory
             ]
